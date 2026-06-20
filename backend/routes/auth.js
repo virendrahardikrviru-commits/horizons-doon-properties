@@ -1,248 +1,126 @@
 import express from 'express';
-import crypto from 'crypto';
-import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
-import nodemailer from 'nodemailer';
 import { query } from '../config/database.js';
-import { authenticate } from '../middleware/auth.js';  // ✅ Add this line
+import { OAuth2Client } from 'google-auth-library';
 
 const router = express.Router();
+const JWT_SECRET = process.env.JWT_SECRET || 'your-super-secret-jwt-key-change-this-in-production';
 
-// Email transporter configuration for Hostinger/Titan
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST || 'smtp.titan.email',
-  port: parseInt(process.env.SMTP_PORT) || 465,
-  secure: true,
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS
-  }
-});
+// ✅ Initialize Google OAuth2 Client
+const googleClient = new OAuth2Client(
+  process.env.GOOGLE_CLIENT_ID,
+  process.env.GOOGLE_CLIENT_SECRET
+);
 
-// Helper function to generate verification token
-const generateVerificationToken = () => {
-  return crypto.randomBytes(32).toString('hex');
-};
-
-// ========== Email/Password Registration (No Email Verification Required) ==========
-router.post('/register', async (req, res) => {
-  try {
-    const { email, password, name, phone } = req.body;
-
-    if (!email || !password) {
-      return res.status(400).json({ success: false, message: 'Email and password required' });
-    }
-
-    if (phone && !/^\d{10}$/.test(phone)) {
-      return res.status(400).json({ success: false, message: 'Please enter a valid 10-digit phone number' });
-    }
-
-    const existingUser = await query('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
-
-    if (existingUser.rows.length > 0) {
-      return res.status(400).json({ success: false, message: 'User already exists' });
-    }
-
-    const saltRounds = 10;
-    const passwordHash = await bcrypt.hash(password, saltRounds);
-
-    const result = await query(
-      `INSERT INTO users (email, name, password_hash, phone, auth_provider, created_via, email_verified)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING id, email, name`,
-      [email.toLowerCase(), name || email.split('@')[0], passwordHash, phone || null, 'email', 'email', true]
-    );
-
-    const user = result.rows[0];
-
-    try {
-      await transporter.sendMail({
-        from: `"Dehradun Estates" <${process.env.SMTP_FROM || 'noreply@dehradunestates.com'}>`,
-        to: email,
-        subject: 'Welcome to Dehradun Estates!',
-        html: `<h2>Welcome to Dehradun Estates, ${user.name}!</h2><p>Your account has been successfully created.</p>`
-      });
-    } catch (emailError) {
-      console.log('Welcome email sending failed:', emailError.message);
-    }
-
-    res.status(201).json({
-      success: true,
-      message: 'Registration successful! You can now log in.',
-      data: { id: user.id, email: user.email, name: user.name }
-    });
-
-  } catch (error) {
-    console.error('Registration error:', error);
-    res.status(500).json({ success: false, message: 'Registration failed' });
-  }
-});
-
-// ========== Email/Password Login ==========
-router.post('/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
-
-    if (!email || !password) {
-      return res.status(400).json({ success: false, message: 'Email and password required' });
-    }
-
-    const result = await query(
-      `SELECT id, email, name, password_hash, email_verified, auth_provider, google_id, phone
-       FROM users WHERE email = $1`,
-      [email.toLowerCase()]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(401).json({ success: false, message: 'Invalid email or password' });
-    }
-
-    const user = result.rows[0];
-
-    if (user.auth_provider === 'google' && user.google_id) {
-      return res.status(400).json({ success: false, message: 'This email is registered with Google. Please sign in with Google.' });
-    }
-
-    const isValid = await bcrypt.compare(password, user.password_hash);
-    if (!isValid) {
-      return res.status(401).json({ success: false, message: 'Invalid email or password' });
-    }
-
-    const token = jwt.sign(
-      { id: user.id, email: user.email, name: user.name },
-      process.env.JWT_SECRET,
-      { expiresIn: '7d' }
-    );
-
-    res.json({
-      success: true,
-      token,
-      user: {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        avatarInitial: user.name?.charAt(0).toUpperCase() || 'U',
-        phone: user.phone
-      },
-      message: 'Login successful'
-    });
-
-  } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({ success: false, message: 'Login failed' });
-  }
-});
-
-// ========== Google OAuth Login ==========
+// ✅ Google OAuth login with credential (JWT)
 router.post('/google', async (req, res) => {
-  try {
-    const { email, name, googleId, avatarInitial, picture } = req.body;
+  const { credential } = req.body;
 
+  if (!credential) {
+    return res.status(400).json({ 
+      success: false, 
+      error: 'No credential provided' 
+    });
+  }
+
+  try {
+    console.log('🔐 Verifying Google credential...');
+
+    // ✅ Verify the JWT credential
+    const ticket = await googleClient.verifyIdToken({
+      idToken: credential,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+
+    const payload = ticket.getPayload();
+    const { sub: googleId, email, name, picture } = payload;
+
+    console.log(`✅ Google user verified: ${email}`);
+
+    // ✅ Check if user exists in database
     let result = await query(
-      `SELECT id, email, name, auth_provider, phone FROM users WHERE email = $1`,
-      [email.toLowerCase()]
+      'SELECT * FROM users WHERE email = $1 OR google_id = $2',
+      [email, googleId]
     );
 
     let user;
+
     if (result.rows.length === 0) {
+      // ✅ Create new user
+      console.log(`🆕 Creating new user: ${email}`);
+      const avatarInitial = name ? name.charAt(0).toUpperCase() : 'U';
+      
       const insertResult = await query(
-        `INSERT INTO users (email, name, google_id, avatar_initial, picture, auth_provider, created_via, email_verified)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         RETURNING id, email, name`,
-        [email.toLowerCase(), name, googleId, avatarInitial, picture, 'google', 'google', true]
+        `INSERT INTO users (google_id, email, name, avatar_initial, picture, created_at) 
+         VALUES ($1, $2, $3, $4, $5, NOW()) 
+         RETURNING id, google_id, email, name, avatar_initial, picture`,
+        [googleId, email, name, avatarInitial, picture]
       );
+      
       user = insertResult.rows[0];
     } else {
+      // ✅ Update existing user
       user = result.rows[0];
+      
+      // Update google_id if missing
       if (!user.google_id) {
-        await query(`UPDATE users SET google_id = $1, picture = $2 WHERE id = $3`, [googleId, picture, user.id]);
+        await query(
+          'UPDATE users SET google_id = $1 WHERE id = $2',
+          [googleId, user.id]
+        );
+        user.google_id = googleId;
+      }
+      
+      // Update name/picture if changed
+      if (user.name !== name || user.picture !== picture) {
+        await query(
+          'UPDATE users SET name = $1, picture = $2 WHERE id = $3',
+          [name, picture, user.id]
+        );
+        user.name = name;
+        user.picture = picture;
       }
     }
 
+    // ✅ Generate JWT token for your app
     const token = jwt.sign(
-      { id: user.id, email: user.email, name: user.name },
-      process.env.JWT_SECRET,
+      { 
+        id: user.id, 
+        email: user.email,
+        google_id: user.google_id 
+      },
+      JWT_SECRET,
       { expiresIn: '7d' }
     );
 
+    console.log(`✅ Login successful for: ${email}`);
+
     res.json({
       success: true,
-      token,
+      token: token,
       user: {
         id: user.id,
         name: user.name,
         email: user.email,
-        avatarInitial: avatarInitial || user.name?.charAt(0).toUpperCase() || 'U',
-        picture: picture,
-        phone: user.phone || null
-      },
-      message: 'Google login successful'
+        avatarInitial: user.avatar_initial || user.name?.charAt(0) || 'U',
+        picture: user.picture
+      }
     });
 
   } catch (error) {
-    console.error('Google auth error:', error);
-    res.status(500).json({ success: false, message: 'Google authentication failed' });
-  }
-});
-
-// ========== Update User Phone Number ==========
-router.put('/update-phone', authenticate, async (req, res) => {
-  try {
-    const { phone } = req.body;
-    const userId = req.user.id;
-
-    if (!phone || !/^\d{10}$/.test(phone)) {
-      return res.status(400).json({ success: false, message: 'Please enter a valid 10-digit phone number' });
+    console.error('❌ Google auth error:', error);
+    
+    if (error.message.includes('idToken')) {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid Google credential. Please try again.'
+      });
     }
 
-    await query(`UPDATE users SET phone = $1 WHERE id = $2`, [phone, userId]);
-
-    res.json({
-      success: true,
-      message: 'Phone number updated successfully'
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Authentication failed. Please try again.'
     });
-  } catch (error) {
-    console.error('Update phone error:', error);
-    res.status(500).json({ success: false, message: 'Failed to update phone number' });
-  }
-});
-
-// ========== Email Verification Endpoint (Optional - kept for future use) ==========
-router.get('/verify-email', async (req, res) => {
-  try {
-    const { token } = req.query;
-
-    if (!token) {
-      return res.status(400).json({ success: false, message: 'Verification token required' });
-    }
-
-    const result = await query(
-      `SELECT id, email, email_verified, token_expires_at 
-       FROM users WHERE verification_token = $1 AND auth_provider = 'email'`,
-      [token]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(400).json({ success: false, message: 'Invalid or expired verification token' });
-    }
-
-    const user = result.rows[0];
-
-    if (user.email_verified) {
-      return res.status(400).json({ success: false, message: 'Email already verified' });
-    }
-
-    if (user.token_expires_at && new Date(user.token_expires_at) < new Date()) {
-      return res.status(400).json({ success: false, message: 'Verification token expired' });
-    }
-
-    await query(`UPDATE users SET email_verified = true, verification_token = NULL, token_expires_at = NULL WHERE id = $1`, [user.id]);
-
-    res.json({ success: true, message: 'Email verified successfully! You can now log in.' });
-
-  } catch (error) {
-    console.error('Verification error:', error);
-    res.status(500).json({ success: false, message: 'Verification failed' });
   }
 });
 

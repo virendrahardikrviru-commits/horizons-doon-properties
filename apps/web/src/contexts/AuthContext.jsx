@@ -18,30 +18,18 @@ export const AuthProvider = ({ children }) => {
       
       if (token && storedUser) {
         try {
-          // ✅ Temporarily skip backend verification to avoid 404 error
-          // const response = await authApi.verifyToken();
-          // if (response.success) {
-            const parsedUser = JSON.parse(storedUser);
-            setUser(parsedUser);
-            setIsLoggedIn(true);
-            
-            const storedFavs = localStorage.getItem(`userFavorites_${parsedUser.email}`);
-            if (storedFavs) {
-              setFavorites(JSON.parse(storedFavs));
-            }
-          // } else {
-          //   localStorage.removeItem('auth_token');
-          //   localStorage.removeItem('auth_user');
-          // }
-        } catch (error) {
-          console.error('Auth verification failed:', error);
-          // ✅ Don't clear storage on verification error
-          // localStorage.removeItem('auth_token');
-          // localStorage.removeItem('auth_user');
-          // Instead, still try to use stored user
           const parsedUser = JSON.parse(storedUser);
           setUser(parsedUser);
           setIsLoggedIn(true);
+          
+          const storedFavs = localStorage.getItem(`userFavorites_${parsedUser.email}`);
+          if (storedFavs) {
+            setFavorites(JSON.parse(storedFavs));
+          }
+        } catch (error) {
+          console.error('Auth verification failed:', error);
+          localStorage.removeItem('auth_token');
+          localStorage.removeItem('auth_user');
         }
       }
       setIsLoading(false);
@@ -50,15 +38,13 @@ export const AuthProvider = ({ children }) => {
     initializeAuth();
   }, []);
 
-  // New login function that directly sets user (called from SignInModal)
-  const loginWithGoogle = async (userData) => {
+  // ✅ UPDATED: loginWithGoogle accepts credential (JWT) from Google SDK
+  const loginWithGoogle = async (credential) => {
+    console.log('🔐 loginWithGoogle called with credential:', credential ? 'Received' : 'Empty');
+    
     try {
       const response = await authApi.googleAuth({
-        email: userData.email,
-        name: userData.name,
-        googleId: userData.googleId,
-        avatarInitial: userData.avatarInitial,
-        picture: userData.picture
+        credential: credential  // ✅ Send credential (JWT) instead of access_token
       });
 
       if (response.success) {
@@ -73,10 +59,13 @@ export const AuthProvider = ({ children }) => {
         
         toast.success('Welcome back!');
         return true;
+      } else {
+        toast.error(response.message || 'Authentication failed');
+        return false;
       }
     } catch (error) {
-      console.error('Google auth error:', error);
-      toast.error('Authentication failed. Please try again.');
+      console.error('❌ Google auth error:', error);
+      toast.error(error.message || 'Authentication failed. Please try again.');
       return false;
     }
   };
@@ -84,7 +73,7 @@ export const AuthProvider = ({ children }) => {
   // Email/Password login
   const loginWithEmail = async (email, password) => {
     try {
-      const response = await fetch('http://localhost:5000/api/auth/login', {
+      const response = await fetch(`${import.meta.env.VITE_API_URL}/auth/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password })
